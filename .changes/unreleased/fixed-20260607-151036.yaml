@@ -1,0 +1,6 @@
+kind: fixed
+body: Redact sensitive data in debug log request bodies, response headers, and response bodies
+time: 2026-06-07T15:10:36+02:00
+custom:
+    Author: iemejia
+    AuthorLink: https://github.com/iemejia
