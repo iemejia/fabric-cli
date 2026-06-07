@@ -345,3 +345,331 @@ def test_log_file_rotation_preserves_restricted_permissions_success(
     # Cleanup
     test_logger.removeHandler(handler)
     handler.close()
+
+
+# ── Security: response header masking tests ──────────────────────────────────
+
+
+def test_log_debug_http_response_masks_set_cookie(monkeypatch):
+    """Verify Set-Cookie response headers are masked to prevent credential leakage."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    try:
+        logger.log_debug_http_response(
+            200,
+            {"Set-Cookie": "session=secret_value; Path=/; HttpOnly"},
+            "",
+            time.time(),
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    cookie_lines = [l for l in captured if "Set-Cookie" in l]
+    assert len(cookie_lines) == 1
+    assert "secret_value" not in cookie_lines[0]
+    assert "*****" in cookie_lines[0]
+
+
+def test_log_debug_http_response_masks_continuation_header(monkeypatch):
+    """Verify x-ms-continuation headers are masked."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    try:
+        logger.log_debug_http_response(
+            200,
+            {"x-ms-continuation": "secret-pagination-token"},
+            "",
+            time.time(),
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    cont_lines = [l for l in captured if "x-ms-continuation" in l]
+    assert len(cont_lines) == 1
+    assert "secret-pagination-token" not in cont_lines[0]
+    assert "*****" in cont_lines[0]
+
+
+def test_log_debug_http_response_preserves_non_sensitive_headers(monkeypatch):
+    """Verify non-sensitive headers are logged in plaintext."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    try:
+        logger.log_debug_http_response(
+            200,
+            {"Content-Type": "application/json", "x-ms-request-id": "req-123"},
+            "",
+            time.time(),
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    ct_lines = [l for l in captured if "Content-Type" in l]
+    assert "application/json" in ct_lines[0]
+
+    rid_lines = [l for l in captured if "x-ms-request-id" in l]
+    assert "req-123" in rid_lines[0]
+
+
+# ── Security: response body redaction tests ──────────────────────────────────
+
+
+def test_redact_sensitive_values_redacts_known_keys():
+    """Verify _redact_sensitive_values masks all known sensitive keys."""
+    obj = {
+        "value": [{"id": "ws-1"}],
+        "sasToken": "sv=2021&sig=SECRET",
+        "connectionString": "AccountKey=SECRET",
+        "continuationToken": "token123",
+        "safe_key": "visible",
+    }
+    redacted = logger._redact_sensitive_values(obj)
+    assert redacted["sasToken"] == "*****"
+    assert redacted["connectionString"] == "*****"
+    assert redacted["continuationToken"] == "*****"
+    assert redacted["safe_key"] == "visible"
+    assert redacted["value"] == [{"id": "ws-1"}]
+
+
+def test_redact_sensitive_values_handles_nested_objects():
+    """Verify redaction works recursively in nested structures."""
+    obj = {
+        "outer": {
+            "inner": {
+                "password": "secret123",
+                "name": "visible",
+            }
+        },
+        "items": [
+            {"accessToken": "tok1", "id": "1"},
+            {"refreshToken": "tok2", "id": "2"},
+        ],
+    }
+    redacted = logger._redact_sensitive_values(obj)
+    assert redacted["outer"]["inner"]["password"] == "*****"
+    assert redacted["outer"]["inner"]["name"] == "visible"
+    assert redacted["items"][0]["accessToken"] == "*****"
+    assert redacted["items"][0]["id"] == "1"
+    assert redacted["items"][1]["refreshToken"] == "*****"
+
+
+def test_redact_and_format_json_redacts_sensitive_keys():
+    """Verify the full JSON redaction + formatting pipeline."""
+    input_json = json.dumps({"sasToken": "sig=SECRET", "name": "test"})
+    result = logger._redact_and_format_json(input_json)
+    parsed = json.loads(result)
+    assert parsed["sasToken"] == "*****"
+    assert parsed["name"] == "test"
+
+
+def test_redact_and_format_json_handles_bad_json():
+    """Verify graceful handling of malformed JSON."""
+    result = logger._redact_and_format_json("{ bad json")
+    assert result == "Failed to parse JSON response"
+
+
+def test_log_debug_http_response_redacts_body_sensitive_keys(monkeypatch):
+    """Verify the full logging path redacts sensitive keys in response bodies."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    response_body = json.dumps({
+        "value": [{"id": "ws-1"}],
+        "sasToken": "sv=2021-06-08&sig=REAL_SIGNATURE",
+        "continuationToken": "eyJwYWdl",
+    })
+
+    try:
+        logger.log_debug_http_response(
+            200,
+            {"Content-Type": "application/json"},
+            response_body,
+            time.time(),
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    body_lines = [l for l in captured if "sasToken" in l or "REAL_SIGNATURE" in l]
+    full_log = " ".join(captured)
+    assert "REAL_SIGNATURE" not in full_log
+    assert "eyJwYWdl" not in full_log
+
+
+# ── Security: request body redaction tests ───────────────────────────────────
+
+
+def test_log_debug_http_request_redacts_json_body(monkeypatch):
+    """Verify request body JSON payloads have sensitive keys redacted."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    request_body = {
+        "name": "my-connection",
+        "credentialDetails": {
+            "password": "SuperSecret123",
+            "clientSecret": "spn-secret-value",
+        },
+    }
+
+    try:
+        logger.log_debug_http_request(
+            "POST", "http://example.com/connections", {}, 10, json=request_body
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    full_log = " ".join(captured)
+    assert "SuperSecret123" not in full_log
+    assert "spn-secret-value" not in full_log
+    assert "my-connection" in full_log
+
+
+def test_log_debug_http_request_redacts_data_body(monkeypatch):
+    """Verify request data payloads have sensitive keys redacted."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    request_data = {
+        "sasToken": "sv=2021&sig=SECRET_SIG",
+        "tableName": "sales",
+    }
+
+    try:
+        logger.log_debug_http_request(
+            "POST", "http://example.com/tables", {}, 10, data=request_data
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    full_log = " ".join(captured)
+    assert "SECRET_SIG" not in full_log
+    assert "sales" in full_log
+
+
+def test_log_debug_http_request_redacts_file_content(monkeypatch):
+    """Verify file upload values are not logged (only keys)."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    try:
+        logger.log_debug_http_request(
+            "POST", "http://example.com/upload", {}, 10,
+            files={"definition": "binary-content-with-secrets"},
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    full_log = " ".join(captured)
+    assert "binary-content-with-secrets" not in full_log
+    assert "definition" in full_log
+
+
+# ── Security: case-insensitive key redaction ─────────────────────────────────
+
+
+def test_redact_sensitive_values_case_insensitive():
+    """Verify redaction is case-insensitive for key matching."""
+    obj = {
+        "SasToken": "sig=SECRET1",
+        "PASSWORD": "secret2",
+        "connectionString": "AccountKey=secret3",
+        "ClientSecret": "secret4",
+        "safeName": "visible",
+    }
+    redacted = logger._redact_sensitive_values(obj)
+    assert redacted["SasToken"] == "*****"
+    assert redacted["PASSWORD"] == "*****"
+    assert redacted["connectionString"] == "*****"
+    assert redacted["ClientSecret"] == "*****"
+    assert redacted["safeName"] == "visible"
+
+
+# ── Security: non-JSON response body scrubbing ──────────────────────────────
+
+
+def test_scrub_secret_patterns_sas_signature():
+    """Verify SAS signatures are scrubbed from plain text."""
+    text = "Error accessing https://storage.blob.core.windows.net/container?sv=2021&sig=AbCdEfGh123%2B&se=2024-12-31"
+    result = logger._scrub_secret_patterns(text)
+    assert "AbCdEfGh123" not in result
+    assert "*****" in result
+    assert "container" in result
+
+
+def test_scrub_secret_patterns_bearer_token():
+    """Verify Bearer tokens are scrubbed from plain text."""
+    text = "Authorization failed: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig"
+    result = logger._scrub_secret_patterns(text)
+    assert "eyJhbGciOiJSUzI1NiI" not in result
+    assert "*****" in result
+
+
+def test_scrub_secret_patterns_account_key():
+    """Verify AccountKey values are scrubbed from plain text."""
+    text = "Connection string: DefaultEndpointsProtocol=https;AccountKey=abc123+def456/ghi789=;EndpointSuffix=core.windows.net"
+    result = logger._scrub_secret_patterns(text)
+    assert "abc123+def456" not in result
+    assert "*****" in result
+
+
+def test_scrub_secret_patterns_preserves_safe_text():
+    """Verify normal text is not modified by scrubbing."""
+    text = "Operation completed successfully for workspace my-workspace"
+    result = logger._scrub_secret_patterns(text)
+    assert result == text
+
+
+def test_log_debug_http_response_scrubs_non_json_body(monkeypatch):
+    """Verify non-JSON response bodies have secret patterns scrubbed."""
+    monkeypatch.setattr(fab_state_config, "get_config", lambda x: "true")
+
+    captured = []
+    test_logger = logger.get_logger()
+    original_debug = test_logger.debug
+    test_logger.debug = lambda msg: captured.append(msg)
+
+    non_json_body = "Error: sig=SuperSecretSignature123 at endpoint /api/v1"
+
+    try:
+        logger.log_debug_http_response(
+            400,
+            {"Content-Type": "text/plain"},
+            non_json_body,
+            time.time(),
+        )
+    finally:
+        test_logger.debug = original_debug
+
+    full_log = " ".join(captured)
+    assert "SuperSecretSignature123" not in full_log

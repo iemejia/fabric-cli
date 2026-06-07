@@ -357,7 +357,12 @@ def _print_response_details(response: ApiResponse) -> None:
     except json.JSONDecodeError:
         pass
 
-    fab_logger.log_debug(json.dumps(dict(response_details), indent=4))
+    # Redact sensitive values before logging to avoid leaking secrets
+    # that bypass the primary log_debug_http_response pipeline.
+    from fabric_cli.core.fab_logger import _redact_sensitive_values
+
+    redacted = _redact_sensitive_values(response_details)
+    fab_logger.log_debug(json.dumps(dict(redacted), indent=4))
 
 
 def _handle_fab_long_running_op(response: ApiResponse) -> ApiResponse:

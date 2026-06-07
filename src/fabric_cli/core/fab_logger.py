@@ -22,6 +22,40 @@ from fabric_cli.utils.fab_secure_io import (
 _logger_instance = None  # Singleton instance
 log_file_path = None  # Path to the current log file
 
+# Response headers that must be masked in debug logs to prevent credential leakage.
+_SENSITIVE_RESPONSE_HEADERS = frozenset(
+    {
+        "set-cookie",
+        "x-ms-continuation",
+        "www-authenticate",
+        "x-ms-ratelimit-remaining-subscription-reads",
+    }
+)
+
+# JSON keys whose values must be redacted in logged request/response bodies.
+# Matching is case-insensitive (keys are lowered before lookup).
+_SENSITIVE_BODY_KEYS = frozenset(
+    {
+        "sastoken",
+        "sasurl",
+        "connectionstring",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "continuationtoken",
+        "password",
+        "secret",
+        "accountkey",
+        "primarykey",
+        "secondarykey",
+        "clientsecret",
+        "client_secret",
+        "apikey",
+        "sharedaccesskey",
+        "credentials",
+    }
+)
+
 
 def log_warning(message, command=None):
     """Print a warning message."""
@@ -76,16 +110,16 @@ def log_debug_http_request(
             continue  # Skip logging the User-Agent header
         logger.debug(f"    '{key}': '{value}'")
 
-    # Body
+    # Body — redact sensitive keys in request payloads
     logger.debug("> Request body:")
     if json:
-        logger.debug("    " + str(json))
+        logger.debug("    " + _redact_and_format_json_obj(json))
     elif data:
-        logger.debug("    " + str(data))
+        logger.debug("    " + _redact_and_format_json_obj(data))
     elif files:
         logger.debug("    Files:")
         for file_key, file_value in files.items():
-            logger.debug(f"        '{file_key}': '{file_value}'")
+            logger.debug(f"        '{file_key}': [file content]")
     else:
         logger.debug("    None")
 
@@ -118,22 +152,27 @@ def log_debug_http_response(status_code, headers, response_text, start_time):
     logger.debug(f"< * Response received at {response_time}")
     logger.debug(f"< Status: {status_code} {status_text}")
 
-    # Headers
+    # Headers — mask sensitive response headers to prevent credential leakage
     logger.debug("< Response headers:")
     for key, value in headers.items():
+        if key.lower() in _SENSITIVE_RESPONSE_HEADERS:
+            value = "*****"
         logger.debug(f"    '{key}': '{value}'")
 
-    # Body
+    # Body — redact sensitive keys before logging
     logger.debug("< Response body:")
     if response_text is None or response_text == "":
         logger.debug("    None")
     else:
         content_type = headers.get("Content-Type", "")
         if "application/json" in content_type:
-            logger.debug("    " + _parse_json_into_single_line(response_text))
+            logger.debug(
+                "    " + _redact_and_format_json(response_text)
+            )
         else:
-            # If not JSON, log as plain text
-            logger.debug("    " + response_text)
+            # Non-JSON bodies may still contain secrets (SAS tokens, bearer
+            # tokens, etc.).  Scrub known secret patterns before logging.
+            logger.debug("    " + _scrub_secret_patterns(response_text))
 
     # Response time
     response_time_sec = end_time - start_time
@@ -273,3 +312,59 @@ def _parse_json_into_single_line(json_text):
         return compact_json
     except json.JSONDecodeError:
         return "Failed to parse JSON response"
+
+
+def _redact_sensitive_values(obj):
+    """Recursively redact values of sensitive keys in a parsed JSON object.
+
+    Key matching is case-insensitive to catch variations like
+    ``sasToken``, ``SasToken``, ``SASTOKEN``, etc.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: "*****"
+            if k.lower() in _SENSITIVE_BODY_KEYS
+            else _redact_sensitive_values(v)
+            for k, v in obj.items()
+        }
+    elif isinstance(obj, list):
+        return [_redact_sensitive_values(item) for item in obj]
+    return obj
+
+
+def _redact_and_format_json(json_text):
+    """Parse JSON text, redact sensitive keys, and return as a compact single line."""
+    try:
+        parsed_json = json.loads(json_text)
+        redacted = _redact_sensitive_values(parsed_json)
+        return json.dumps(redacted, separators=(",", ":"))
+    except json.JSONDecodeError:
+        return "Failed to parse JSON response"
+
+
+def _redact_and_format_json_obj(obj):
+    """Redact sensitive keys from an already-parsed object (dict/list) and format as JSON."""
+    try:
+        redacted = _redact_sensitive_values(obj)
+        return json.dumps(redacted, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+# Regex patterns for secrets that may appear in non-JSON text
+import re
+
+_SECRET_PATTERNS = re.compile(
+    r"("
+    r"sig=[A-Za-z0-9%+/=]+"        # SAS signature parameter
+    r"|Bearer\s+[A-Za-z0-9\-._~+/]+=*"  # Bearer tokens
+    r"|AccountKey=[A-Za-z0-9+/=]+"  # Storage account keys
+    r"|SharedAccessKey=[A-Za-z0-9+/=]+"  # Service Bus / Event Hub keys
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secret_patterns(text):
+    """Replace known secret patterns in plain text with '*****'."""
+    return _SECRET_PATTERNS.sub("*****", text)
