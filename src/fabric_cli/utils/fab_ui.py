@@ -116,6 +116,12 @@ def print_output_format(
         FabricCLIOutput: Configured output instance ready for printing
     """
 
+    # Apply untrusted content wrapping (default: on, disabled via --no-wrap-untrusted)
+    if getattr(args, "wrap_untrusted", False) and data is not None:
+        from fabric_cli.utils.fab_untrusted import wrap_untrusted_fields
+
+        data = wrap_untrusted_fields(data)
+
     command = getattr(args, "command", None)
     subcommand = getattr(args, f"{command}_subcommand", None)
 
@@ -148,9 +154,7 @@ def print_output_format(
             _print_output_format_result_text(output)
         case _:
             raise FabricCLIError(
-                ErrorMessages.Common.output_format_not_supported(
-                    str(format_type)
-                ),
+                ErrorMessages.Common.output_format_not_supported(str(format_type)),
                 fab_constant.ERROR_NOT_SUPPORTED,
             )
 
@@ -211,9 +215,7 @@ def print_output_error(
             return
         case _:
             raise FabricCLIError(
-                ErrorMessages.Common.output_format_not_supported(
-                    str(format_type)
-                ),
+                ErrorMessages.Common.output_format_not_supported(str(format_type)),
                 fab_constant.ERROR_NOT_SUPPORTED,
             )
 
@@ -295,10 +297,7 @@ def print_entries_unix_style(
         widths = [
             max(
                 _get_visual_length(field),
-                max(
-                    get_visual_length(entry, field)
-                    for entry in _entries
-                ),
+                max(get_visual_length(entry, field) for entry in _entries),
             )
             for field in fields
         ]
@@ -327,8 +326,7 @@ def print_entries_unix_style(
             new_widths = [max(min_col_width, int(w * scale)) for w in widths]
             # Fine-tune: trim the largest column until we fit
             while sum(new_widths) + separator_space > terminal_width:
-                max_idx = max(range(len(new_widths)),
-                              key=lambda k: new_widths[k])
+                max_idx = max(range(len(new_widths)), key=lambda k: new_widths[k])
                 if new_widths[max_idx] <= min_col_width:
                     break
                 new_widths[max_idx] -= 1
@@ -337,8 +335,7 @@ def print_entries_unix_style(
                 base = available // n
                 remainder = available % n
                 new_widths = [
-                    max(1, base + (1 if i < remainder else 0))
-                    for i in range(n)
+                    max(1, base + (1 if i < remainder else 0)) for i in range(n)
                 ]
             widths = new_widths
 
@@ -347,8 +344,11 @@ def print_entries_unix_style(
         for line in header_lines:
             print_grey(line, to_stderr=False)
         # Print a separator line matching the width of the first header line
-        separator_width = _get_visual_length(
-            header_lines[0]) if header_lines else (sum(widths) + len(widths) - 1)
+        separator_width = (
+            _get_visual_length(header_lines[0])
+            if header_lines
+            else (sum(widths) + len(widths) - 1)
+        )
         print_grey("-" * separator_width, to_stderr=False)
 
     for entry in _entries:
@@ -416,9 +416,9 @@ def _print_output_format_result_text(output: FabricCLIOutput) -> None:
             data_keys = output.result.get_data_keys() if output_result.data else []
             if len(data_keys) > 0:
                 print_entries_unix_style(
-                    output_result.data, data_keys, header=(
-                        len(data_keys) > 1 or show_headers
-                    )
+                    output_result.data,
+                    data_keys,
+                    header=(len(data_keys) > 1 or show_headers),
                 )
             else:
                 _print_raw_data(output_result.data)
@@ -503,9 +503,7 @@ def _print_error_format_json(output: str) -> None:
 
 def _print_error_format_text(message: str, command: Optional[str] = None) -> None:
     command_text = f"{command}: " if command else ""
-    _safe_print_formatted_text(
-        f"<ansired>x</ansired> {command_text}{message}", message
-    )
+    _safe_print_formatted_text(f"<ansired>x</ansired> {command_text}{message}", message)
 
 
 def _print_fallback(text: str, e: Exception, to_stderr: bool = False) -> None:
@@ -629,21 +627,24 @@ def _format_key_to_convert_to_title_case(key: str) -> str:
         ValueError: If the key is not in the expected underscore-separated format
     """
     # Allow letters, numbers, and underscores only
-    if not key.replace('_', '').replace(' ', '').isalnum():
+    if not key.replace("_", "").replace(" ", "").isalnum():
         raise ValueError(
-            f"Invalid key format: '{key}'. Only underscore-separated words are allowed.")
+            f"Invalid key format: '{key}'. Only underscore-separated words are allowed."
+        )
 
     # Check for invalid patterns (camelCase, spaces mixed with underscores, etc.)
-    if ' ' in key and '_' in key:
+    if " " in key and "_" in key:
         raise ValueError(
-            f"Invalid key format: '{key}'. Only underscore-separated words are allowed.")
+            f"Invalid key format: '{key}'. Only underscore-separated words are allowed."
+        )
 
     # Check for camelCase pattern (uppercase letters not at the start)
-    if any(char.isupper() for char in key[1:]) and '_' not in key:
+    if any(char.isupper() for char in key[1:]) and "_" not in key:
         raise ValueError(
-            f"Invalid key format: '{key}'. Only underscore-separated words are allowed.")
+            f"Invalid key format: '{key}'. Only underscore-separated words are allowed."
+        )
 
-    pretty = key.replace('_', ' ').title().strip()
+    pretty = key.replace("_", " ").title().strip()
 
     return _check_special_cases(pretty)
 
